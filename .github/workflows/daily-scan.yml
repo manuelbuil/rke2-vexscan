@@ -1,0 +1,112 @@
+name: Daily RKE2 CVE lookup
+
+on:
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+    inputs:
+      minors:
+        description: 'RKE2 minor versions to scan, space-separated (e.g. "1.36 1.37")'
+        required: false
+        type: string
+        default: '1.36 1.37'
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Only one Pages deployment at a time; a new run supersedes one still in flight
+# rather than racing it.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+env:
+  # Pinned for reproducibility -- v0.24.2 is the floor for --prefer-vendor
+  # suse (SUSE reorganised its CSAF-VEX feed into year directories on
+  # 2026-10-15; every earlier vexscan version 404s against it and silently
+  # reports every finding as UNKNOWN severity instead of erroring).
+  VEXSCAN_VERSION: v0.24.5
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+
+      - name: Install vexscan
+        run: |
+          go install "github.com/cwayne18/vexscan@${VEXSCAN_VERSION}"
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Install govulncheck
+        # Enables vexscan's govulncheck symbol-reachability check (otherwise skipped).
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+
+      - name: Install skopeo
+        run: sudo apt-get update && sudo apt-get install -y skopeo
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install PyYAML and Helm
+        uses: azure/setup-helm@v4
+      - run: pip install pyyaml
+
+      - name: Log in to Docker Hub
+        # Anonymous pulls hit Docker Hub's rate limit well before this matrix
+        # (100+ unique images across every scanned release) finishes -- it
+        # fails as a misleading "unauthorized: incorrect username or
+        # password" on perfectly public images, not as a quota message.
+        # Requires the DOCKERHUB_USERNAME / DOCKERHUB_TOKEN repo secrets
+        # (a Docker Hub access token, Account Settings -> Security); rotate
+        # the token if this step starts failing.
+        run: skopeo login docker.io -u "${{ secrets.DOCKERHUB_USERNAME }}" -p "${{ secrets.DOCKERHUB_TOKEN }}"
+
+      - name: Scan the release matrix
+        env:
+          # check-latest-tags resolves each image's build repo's full tag
+          # history via the GitHub API; this authenticates those calls so
+          # ~100+ components don't hit the 60/hour anonymous rate limit.
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          chmod +x list-releases scan-matrix.sh build-matrix-scan.py generate_site.py check-latest-tags gen-rke2-vexscan
+          ./list-releases ${{ inputs.minors || '1.36 1.37' }} | ./scan-matrix.sh
+
+      - name: Render site
+        run: python3 generate_site.py reports/releases site
+
+      - name: Upload raw reports
+        # Not published -- an ephemeral debugging artifact, auto-expiring,
+        # so a bad day's scan is inspectable without bloating the repo
+        # the way committing reports/ on every run used to.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rke2-vexscan-reports
+          path: reports/releases
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

@@ -15,9 +15,13 @@
 # Usage: check-latest-tags <images-file> [--prime] [-o FILE]
 # Output: a JSON array to stdout (or -o FILE), one object per image:
 #   {"image", "image_name", "current_tag", "build_repo", "latest_tag",
-#    "latest_image", "status"}
+#    "latest_image", "status", "all_tags"}
 # "status" is one of NEEDS_UPDATE, UP_TO_DATE, UNKNOWN (no build repo or no
-# tag could be resolved).
+# tag could be resolved). "all_tags" is every tag the build repo publishes
+# that matches this image's own filtering rules (its own tag_regex_override,
+# when it has one), version-sorted -- the same list "latest_tag" was picked
+# from, kept instead of thrown away so a caller can look for a fix at an
+# intermediate tag rather than assuming only the absolute latest fixes it.
 
 set -euo pipefail
 
@@ -134,7 +138,8 @@ github_tags() {
 }
 
 # Resolve an image's build repo and the latest tag it has published. Output:
-# "repo|tag", or empty on failure. Ported from check_images.sh.
+# "repo|tag|all_tags" (all_tags comma-joined, version-sorted ascending), or
+# empty fields on failure. Ported from check_images.sh, with all_tags added.
 find_build_repo_and_latest_tag() {
     local image_name="$1"
     local repo_candidate
@@ -143,6 +148,8 @@ find_build_repo_and_latest_tag() {
     local tag_regex
     local tags
     local filtered_tags
+    local sorted_tags
+    local all_tags_csv
 
     local candidates=()
     override_repo="$(repo_override "$image_name")"
@@ -170,15 +177,17 @@ find_build_repo_and_latest_tag() {
                 filtered_tags=$(printf '%s\n' "$filtered_tags" | grep -E "$tag_regex" || true)
             fi
 
-            latest=$(printf '%s\n' "$filtered_tags" | sed '/^\s*$/d' | sort -uV | tail -1)
+            sorted_tags=$(printf '%s\n' "$filtered_tags" | sed '/^\s*$/d' | sort -uV)
+            latest=$(printf '%s\n' "$sorted_tags" | tail -1)
             if [[ -n "$latest" ]]; then
-                printf '%s|%s\n' "$(normalize_repo_slug "$repo_candidate")" "$latest"
+                all_tags_csv=$(printf '%s\n' "$sorted_tags" | paste -sd, -)
+                printf '%s|%s|%s\n' "$(normalize_repo_slug "$repo_candidate")" "$latest" "$all_tags_csv"
                 return 0
             fi
         fi
     done
 
-    printf '|'
+    printf '||'
     return 1
 }
 
@@ -231,8 +240,7 @@ while IFS= read -r image; do
     current_tag="${parsed##*|}"
 
     repo_latest=$(find_build_repo_and_latest_tag "$image_name" || true)
-    build_repo="${repo_latest%%|*}"
-    latest_tag="${repo_latest##*|}"
+    IFS='|' read -r build_repo latest_tag all_tags <<<"$repo_latest"
 
     if [[ -z "$build_repo" || -z "$latest_tag" ]]; then
         status="UNKNOWN"
@@ -245,8 +253,8 @@ while IFS= read -r image; do
         latest_image=$(replace_ref_tag "$image" "$latest_tag")
     fi
 
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-        "$image" "$image_name" "$current_tag" "${build_repo:-}" "${latest_tag:-}" "$status" "${latest_image:-}" \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$image" "$image_name" "$current_tag" "${build_repo:-}" "${latest_tag:-}" "$status" "${latest_image:-}" "${all_tags:-}" \
         >> "$results_file"
 done < <(awk 'NF && $1 !~ /^#/ {print $1}' "$images_file")
 
@@ -262,9 +270,9 @@ with open(path, encoding="utf-8") as fh:
         if not line:
             continue
         parts = line.split("\t")
-        while len(parts) < 7:
+        while len(parts) < 8:
             parts.append("")
-        image, image_name, current_tag, build_repo, latest_tag, status, latest_image = parts[:7]
+        image, image_name, current_tag, build_repo, latest_tag, status, latest_image, all_tags = parts[:8]
         out.append({
             "image": image,
             "image_name": image_name,
@@ -273,6 +281,7 @@ with open(path, encoding="utf-8") as fh:
             "latest_tag": latest_tag or None,
             "status": status,
             "latest_image": latest_image or None,
+            "all_tags": all_tags.split(",") if all_tags else [],
         })
 print(json.dumps(out))
 PY

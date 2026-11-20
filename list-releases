@@ -1,0 +1,48 @@
+#!/bin/bash
+
+# list-releases -- print the stable RKE2 release tags for one or more minor
+# versions, one tag per line, sorted.
+#
+# "Stable" means no -rc* pre-release suffix. When a patch has shipped more
+# than one rke2rN build (a rebuild with no version bump), only the highest rN
+# is kept -- that is the tag anyone installing that patch today actually gets.
+#
+# Usage: ./list-releases 1.36 1.37
+# Output: v1.36.0+rke2r1
+#         v1.36.1+rke2r2
+#         ...
+
+set -euo pipefail
+
+if [[ $# -eq 0 ]]; then
+    echo "Usage: $0 <minor> [<minor> ...]" >&2
+    echo "  e.g. $0 1.36 1.37" >&2
+    exit 1
+fi
+
+tags_json=$(gh api repos/rancher/rke2/releases --paginate -q '.[].tag_name')
+
+for minor in "$@"; do
+    echo "$tags_json" \
+        | grep -E "^v${minor//./\\.}\.[0-9]+\+rke2r[0-9]+\$" \
+        | awk -F'[.+r]' '
+            # vMAJOR.MINOR.PATCH+rke2rN -> fields: "" MAJOR MINOR PATCH "" "" "" N
+            {
+                tag = $0
+                split(tag, a, "+rke2r")
+                patch_part = a[1]
+                rn = a[2] + 0
+                n = split(patch_part, p, ".")
+                patch = p[n] + 0
+                if (!(patch in best) || rn > best_rn[patch]) {
+                    best[patch] = tag
+                    best_rn[patch] = rn
+                }
+            }
+            END {
+                for (k in best) print k, best[k]
+            }
+        ' \
+        | sort -n -k1,1 \
+        | cut -d' ' -f2-
+done

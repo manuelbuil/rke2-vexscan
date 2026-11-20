@@ -8,3 +8,8 @@ __pycache__/
 /scan.json
 /images.txt
 /fleet.txt
+
+# scan-matrix.sh / build-matrix-scan.py / generate_site.py output -- rebuilt
+# fresh on every run (locally or in CI) and published, not committed.
+/reports/releases/
+/site/
