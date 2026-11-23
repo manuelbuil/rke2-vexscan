@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""build-matrix-scan.py -- scan a set of RKE2 releases' fleet lists with as
-few vexscan invocations as possible, by de-duplicating identical
-(image, assertion) lines across the whole matrix before scanning, then
-reconstructing each release's own batch report from the shared result pool.
+"""build-matrix-scan.py -- scan a set of RKE2 releases' fleet lists by
+component, each component exactly once per tag it needs, then reconstruct
+each release's own batch report and every CVE's fix tag from that single
+sweep.
 
 Called by scan-matrix.sh, one directory per release, each already holding:
   <dir>/release.txt            -- the literal RKE2 release tag
@@ -11,15 +11,22 @@ Called by scan-matrix.sh, one directory per release, each already holding:
                                     gen-rke2-vexscan failed for this release
 
 Writes <dir>/scan.json for every release, in the same batch shape scan.sh's
-own --release mode would have produced scanning it alone.
+own --release mode would have produced scanning it alone, plus a shared
+reports/releases/fix_info.json.
 
-Why not just concatenate every fleet list and scan once: vexscan's own
---images-from refuses a reference named twice when either occurrence carries
-an assertion (imagelist.go's parseImageList) -- even if the two assertions
-are byte-identical, it never compares them, it just rejects the file. So
-lines are only merged when they are *exactly* equal (same ref, same
-assertion text); a ref seen with a second, different assertion elsewhere in
-the matrix gets its own batch instead of erroring out the whole run.
+The approach: for every component (image repo) pinned by any release in the
+matrix, resolve its full published tag history (./check-latest-tags) and scan
+the entire range from the *oldest* tag any release currently pins to that
+component's own *latest* published tag, inclusive -- once. Every release's
+own current pin falls inside its own component's range by construction, so
+this single sweep replaces what used to be three separate passes (scan
+current tags, scan latest tags, binary-search for each CVE's fix point):
+there's nothing left to search for afterward, every CVE's fix tag is read
+straight off the already-scanned range by walking forward until it
+disappears. Simpler, and -- for a matrix where current pins are spread across
+most of a component's own history, which is the common case here -- not
+meaningfully more expensive than the binary search it replaces, since that
+search ended up probing nearly the whole range anyway.
 
 Python 3.8+, standard library only, matching the rest of this project.
 """
@@ -125,118 +132,53 @@ def run_vexscan(batch_file, out_file):
         print(f"  (vexscan exited {proc.returncode}: some image(s) in this batch were not scanned cleanly -- see failures in the output)")
 
 
+def repo_of(ref):
+    return ref.rsplit(":", 1)[0]
+
+
+def write_and_scan(pairs_by_ref, label):
+    """pairs_by_ref: {ref: rest}. One flat batch, one vexscan call -- safe
+    because every ref here is constructed from a distinct (repo, tag) pair,
+    so no ref ever repeats with a different assertion the way the old
+    cross-release dedup had to guard against. Returns {ref: result}."""
+    if not pairs_by_ref:
+        return {}
+    batch_file = os.path.join(WORK_DIR, f"_{label}.txt")
+    with open(batch_file, "w", encoding="utf-8") as fh:
+        for ref, rest in pairs_by_ref.items():
+            fh.write(f"{ref} {rest}\n" if rest else f"{ref}\n")
+    scan_file = os.path.join(WORK_DIR, f"_{label}.scan.json")
+    print(f"--- {label}: {len(pairs_by_ref)} image(s) ---")
+    run_vexscan(batch_file, scan_file)
+    with open(scan_file, encoding="utf-8") as fh:
+        doc = json.load(fh)
+    return {r["target"]: r for r in (doc.get("results") or []) if r and r.get("target")}
+
+
 def main():
     dirs = sys.argv[1:]
     if not dirs:
         print("Usage: build-matrix-scan.py <release-dir> [<release-dir> ...]", file=sys.stderr)
         return 1
 
-    release_lines = {}
-    for d in dirs:
-        release_lines[d] = read_lines(d)
-
-    # variant_order[ref] is the list of distinct "rest" strings seen for that
-    # ref, in first-seen order. Its index IS the batch number: every (ref,
-    # rest) pair with the same index lands in the same batch, and a batch
-    # never contains the same ref twice by construction.
-    variant_order = {}
-
-    def variant_index(ref, rest):
-        variants = variant_order.setdefault(ref, [])
-        if rest not in variants:
-            variants.append(rest)
-        return variants.index(rest)
-
-    batches = {}  # batch_num -> {ref: rest}
-    for d, pairs in release_lines.items():
-        for ref, rest in pairs:
-            v = variant_index(ref, rest)
-            batches.setdefault(v, {})[ref] = rest
-
-    n_batches = len(batches)
-    total_lines = sum(len(v) for v in batches.values())
-    total_scanned_refs = sum(len(p) for p in release_lines.values())
-    print(f"=== {len(dirs)} release(s), {total_scanned_refs} image reference(s) before dedup, "
-          f"{total_lines} unique (image, assertion) line(s), {n_batches} batch(es) ===")
-
+    release_lines = {d: read_lines(d) for d in dirs}
     os.makedirs(WORK_DIR, exist_ok=True)
-    batch_results = {}   # (batch_num, ref) -> result dict
-    batch_failures = {}  # (batch_num, ref) -> error string
 
-    for b, refs in sorted(batches.items()):
-        batch_file = os.path.join(WORK_DIR, f"_batch_{b}.txt")
-        with open(batch_file, "w", encoding="utf-8") as fh:
-            for ref, rest in refs.items():
-                fh.write(f"{ref} {rest}\n" if rest else f"{ref}\n")
-
-        scan_file = os.path.join(WORK_DIR, f"_batch_{b}.scan.json")
-        print(f"--- batch {b}: {len(refs)} image(s) ---")
-        run_vexscan(batch_file, scan_file)
-
-        with open(scan_file, encoding="utf-8") as fh:
-            batch_doc = json.load(fh)
-        for result in batch_doc.get("results") or []:
-            if result and result.get("target"):
-                batch_results[(b, result["target"])] = result
-        for failure in batch_doc.get("failures") or []:
-            if failure and failure.get("target"):
-                batch_failures[(b, failure["target"])] = failure.get("error", "unknown error")
-
-    print("=== Reconstructing per-release reports ===")
-    for d, pairs in release_lines.items():
-        results = []
-        failures = []
+    rest_by_ref = {}
+    for pairs in release_lines.values():
         for ref, rest in pairs:
-            v = variant_order[ref].index(rest)
-            if (v, ref) in batch_results:
-                results.append(batch_results[(v, ref)])
-            elif (v, ref) in batch_failures:
-                failures.append({"target": ref, "error": batch_failures[(v, ref)]})
-            else:
-                failures.append({"target": ref, "error": "not found in any batch output (internal matrix error)"})
+            rest_by_ref.setdefault(ref, rest)
+    all_current_refs = sorted(rest_by_ref)
 
-        doc = {
-            "schema_version": 1,
-            "mode": "batch",
-            "targets": len(results) + len(failures),
-            "results": results,
-            "failures": failures,
-        }
-        filter_fixed_only(doc)
-
-        out_path = os.path.join(d, "scan.json")
-        with open(out_path, "w", encoding="utf-8") as fh:
-            json.dump(doc, fh)
-        print(f"  {d}: {len(results)} scanned, {len(failures)} failed -> {out_path}")
-
-    # --- Which tag fixes each CVE -------------------------------------
+    # --- Resolve each component's full tag history ---------------------
     #
-    # For every component actually scanned above, resolve every tag its build
-    # repo has published (./check-latest-tags, unmodified except that it now
-    # also returns the full tag list it already fetched instead of keeping
-    # only the latest one). A CVE confirmed fixed at the latest tag might
-    # already have been fixed several builds earlier -- "latest" is just
-    # where the search is guaranteed to succeed, not where it necessarily
-    # starts -- so once latest confirms a fix exists, binary-search the
-    # published tags between current and latest for the earliest one that
-    # actually lacks it, assuming (like scan.sh's own staleness check does)
-    # that a fix, once shipped, isn't reintroduced by a later rebuild.
-    #
-    # One probe scans one image, which reports on every CVE being searched
-    # for that component at once, so the search runs in rounds: each round
-    # computes the next midpoint for every CVE still narrowing on a given
-    # component, batches all distinct (component, midpoint) probes the whole
-    # matrix needs that round through the same dedup machinery as the main
-    # pass, then narrows every CVE's bounds from the results. A component
-    # whose CVEs converge on the same midpoints (the common case -- one
-    # rebuild usually fixes several CVEs together) costs one probe for all of
-    # them, not one per CVE.
-    print("=== Resolving latest available tags ===")
-    all_refs = sorted({ref for (_b, ref) in batch_results})
+    # ./check-latest-tags, unmodified in its own contract, extended to also
+    # return the full tag list it already fetches (all_tags) instead of
+    # keeping only the latest one. One entry per currently-pinned ref.
+    print("=== Resolving component tag histories ===")
     refs_file = os.path.join(WORK_DIR, "_all-images.txt")
     with open(refs_file, "w", encoding="utf-8") as fh:
-        fh.write("\n".join(all_refs) + "\n")
-
+        fh.write("\n".join(all_current_refs) + "\n")
     tags_file = os.path.join(WORK_DIR, "_tags.json")
     proc = subprocess.run(
         [os.path.join(SCRIPT_DIR, "check-latest-tags"), refs_file, "-o", tags_file],
@@ -249,141 +191,121 @@ def main():
     else:
         print(f"WARNING: check-latest-tags failed; 'fixes in' info will be unavailable this run\n{proc.stderr}", file=sys.stderr)
 
-    fix_info = {
-        e["image"]: {
-            "current_tag": e.get("current_tag"),
-            "latest_tag": e.get("latest_tag"),
-            "status": e.get("status"),
-            "fixes": {},          # cve -> earliest tag found to lack it
-            "latest_checked": False,
-        }
-        for e in tag_entries
-    }
+    # --- Build one exhaustive scan list per component -------------------
+    #
+    # For each component (image repo), the range from the oldest tag any
+    # release currently pins to the component's own latest published tag,
+    # inclusive -- scanned once. This single list replaces the old separate
+    # "scan current tags" + "scan latest tags" + "binary-search rounds"
+    # passes entirely: every release's current pin falls inside its own
+    # component's range by construction, and every CVE's fix tag can be read
+    # straight off the already-scanned range afterward, with no more
+    # scanning needed to find it.
+    repo_all_tags = {}
+    repo_latest_tag = {}
+    repo_current_tags = {}
+    for e in tag_entries:
+        repo = repo_of(e["image"])
+        repo_current_tags.setdefault(repo, set()).add(e["current_tag"])
+        if e.get("all_tags"):
+            repo_all_tags.setdefault(repo, e["all_tags"])
+        if e.get("latest_tag"):
+            repo_latest_tag.setdefault(repo, e["latest_tag"])
 
-    needs_update = [e for e in tag_entries if e.get("status") == "NEEDS_UPDATE" and e.get("latest_image")]
-    print(f"  {len(tag_entries)} component(s) checked, {len(needs_update)} behind their latest available tag")
+    scan_pairs = {}       # ref -> rest, everything that needs scanning
+    repo_range = {}       # repo -> ordered list of tags actually covered, or None
+    for repo, current_tags in repo_current_tags.items():
+        all_tags = repo_all_tags.get(repo)
+        latest_tag = repo_latest_tag.get(repo)
+        rest = next((rest_by_ref[f"{repo}:{t}"] for t in current_tags if f"{repo}:{t}" in rest_by_ref), "")
 
-    if needs_update:
-        # Reuse whatever assertion the current tag's fleet-list line carried --
-        # the same simplifying assumption scan.sh's own staleness rescan makes
-        # (how RKE2 starts an image doesn't change just because its tag did).
-        ref_to_rest = {}
-        for pairs in release_lines.values():
-            for ref, rest in pairs:
-                ref_to_rest.setdefault(ref, rest)
-
-        def current_affected(ref):
-            ids = set()
-            for (b, r), result in batch_results.items():
-                if r == ref:
-                    ids |= affected_cve_ids(result)
-            return ids
-
-        def repo_part(ref):
-            return ref.rsplit(":", 1)[0]
-
-        scan_cache = {}  # image ref at a specific tag -> affected cve id set, or None on failure
-
-        def scan_new_refs(new_refs, round_label):
-            """new_refs: {ref: rest}. Scans whatever isn't already cached."""
-            to_scan = {r: rest for r, rest in new_refs.items() if r not in scan_cache}
-            if not to_scan:
-                return
-            variants, batches = {}, {}
-            for ref, rest in to_scan.items():
-                vlist = variants.setdefault(ref, [])
-                if rest not in vlist:
-                    vlist.append(rest)
-                batches.setdefault(vlist.index(rest), {})[ref] = rest
-            found = {}
-            for b, refs in sorted(batches.items()):
-                batch_file = os.path.join(WORK_DIR, f"_{round_label}_batch_{b}.txt")
-                with open(batch_file, "w", encoding="utf-8") as fh:
-                    for ref, rest in refs.items():
-                        fh.write(f"{ref} {rest}\n" if rest else f"{ref}\n")
-                scan_file = os.path.join(WORK_DIR, f"_{round_label}_batch_{b}.scan.json")
-                print(f"--- {round_label} batch {b}: {len(refs)} image(s) ---")
-                run_vexscan(batch_file, scan_file)
-                with open(scan_file, encoding="utf-8") as fh:
-                    doc = json.load(fh)
-                for result in doc.get("results") or []:
-                    if result and result.get("target"):
-                        found[result["target"]] = affected_cve_ids(result)
-            for ref in to_scan:
-                scan_cache[ref] = found.get(ref)  # None if it failed to pull/scan
-
-        # Round 0: confirm latest actually fixes something, same as before.
-        latest_pairs = {e["latest_image"]: ref_to_rest.get(e["image"], "") for e in needs_update}
-        scan_new_refs(latest_pairs, "latest")
-
-        search_state = {}  # ref -> {"candidates": [...], "bounds": {cve: [lo, hi]}}
-        for e in needs_update:
-            ref = e["image"]
-            latest_ids = scan_cache.get(e["latest_image"])
-            if latest_ids is None:
-                continue  # latest tag could not be pulled/scanned; leave unverified
-            fixed_by_latest = current_affected(ref) - latest_ids
-            if not fixed_by_latest:
-                continue
-
-            all_tags = e.get("all_tags") or []
+        tags_range = None
+        if all_tags and latest_tag:
             try:
-                lo_idx = all_tags.index(e["current_tag"])
-                hi_idx = all_tags.index(e["latest_tag"])
+                idx_oldest = min(all_tags.index(t) for t in current_tags)
+                idx_latest = all_tags.index(latest_tag)
+                tags_range = all_tags[idx_oldest: idx_latest + 1]
             except ValueError:
-                lo_idx = hi_idx = None
+                tags_range = None  # a current tag or latest isn't in the published list
 
-            if lo_idx is None or hi_idx - lo_idx <= 1:
-                # Can't place current_tag in the published list, or latest is
-                # the very next tag after current -- nothing in between to
-                # search, latest itself is already the earliest fix.
-                for cve in fixed_by_latest:
-                    fix_info[ref]["fixes"][cve] = e["latest_tag"]
-                fix_info[ref]["latest_checked"] = True
-                continue
+        repo_range[repo] = tags_range
+        tags_to_scan = tags_range if tags_range else current_tags
+        for t in tags_to_scan:
+            scan_pairs.setdefault(f"{repo}:{t}", rest)
 
-            candidates = all_tags[lo_idx + 1: hi_idx + 1]  # candidates[-1] == latest_tag
-            search_state[ref] = {
-                "candidates": candidates,
-                "repo": repo_part(ref),
-                "rest": ref_to_rest.get(ref, ""),
-                "bounds": {cve: [0, len(candidates) - 1] for cve in fixed_by_latest},
+    print(f"  {len(repo_current_tags)} component(s), {len(all_current_refs)} pinned reference(s), "
+          f"{len(scan_pairs)} image(s) to scan (exhaustive per-component ranges)")
+
+    results = write_and_scan(scan_pairs, "sweep")
+    affected_by_ref = {ref: affected_cve_ids(r) for ref, r in results.items()}
+
+    # --- Reconstruct each release's own report --------------------------
+    print("=== Reconstructing per-release reports ===")
+    for d, pairs in release_lines.items():
+        res_list, fail_list = [], []
+        for ref, _rest in pairs:
+            if ref in results:
+                res_list.append(results[ref])
+            else:
+                fail_list.append({"target": ref, "error": "not scanned (image pull/scan failed)"})
+
+        doc = {
+            "schema_version": 1,
+            "mode": "batch",
+            "targets": len(res_list) + len(fail_list),
+            "results": res_list,
+            "failures": fail_list,
+        }
+        filter_fixed_only(doc)
+
+        out_path = os.path.join(d, "scan.json")
+        with open(out_path, "w", encoding="utf-8") as fh:
+            json.dump(doc, fh)
+        print(f"  {d}: {len(res_list)} scanned, {len(fail_list)} failed -> {out_path}")
+
+    # --- Which tag fixes each CVE, read straight off the sweep ----------
+    #
+    # For every CVE affecting a current tag, walk forward through that
+    # component's already-scanned range and take the first tag where it's
+    # gone. A tag that failed to scan is skipped rather than treated as
+    # "still affected", so one missing historical build doesn't block
+    # finding a later one that did fix it.
+    print("=== Computing fix tags from the sweep ===")
+    fix_info = {}
+    for repo, current_tags in repo_current_tags.items():
+        latest_tag = repo_latest_tag.get(repo)
+        tags_range = repo_range.get(repo)
+        for current_tag in current_tags:
+            ref = f"{repo}:{current_tag}"
+            if not latest_tag:
+                status = "UNKNOWN"
+            elif current_tag == latest_tag:
+                status = "UP_TO_DATE"
+            else:
+                status = "NEEDS_UPDATE"
+
+            entry = {
+                "current_tag": current_tag,
+                "latest_tag": latest_tag,
+                "status": status,
+                "fixes": {},
+                "latest_checked": False,
             }
-            fix_info[ref]["latest_checked"] = True
 
-        max_rounds = 20  # generous: log2 of even a few thousand tags is ~12
-        for round_num in range(max_rounds):
-            probes = {}  # image ref at candidate tag -> assertion
-            for st in search_state.values():
-                for lo, hi in st["bounds"].values():
-                    if lo < hi:
-                        mid = (lo + hi) // 2
-                        probes[f'{st["repo"]}:{st["candidates"][mid]}'] = st["rest"]
-            if not probes:
-                break
-            scan_new_refs(probes, f"fixsearch-r{round_num}")
+            if status == "NEEDS_UPDATE" and tags_range:
+                current_ids = affected_by_ref.get(ref, set())
+                idx_current = tags_range.index(current_tag)
+                for cve in current_ids:
+                    for later_tag in tags_range[idx_current + 1:]:
+                        later_ids = affected_by_ref.get(f"{repo}:{later_tag}")
+                        if later_ids is None:
+                            continue  # that tag failed to scan; try the next one
+                        if cve not in later_ids:
+                            entry["fixes"][cve] = later_tag
+                            break
+                entry["latest_checked"] = True
 
-            still_active = False
-            for st in search_state.values():
-                for cve, (lo, hi) in st["bounds"].items():
-                    if lo >= hi:
-                        continue
-                    mid = (lo + hi) // 2
-                    probe_ref = f'{st["repo"]}:{st["candidates"][mid]}'
-                    ids = scan_cache.get(probe_ref)
-                    if ids is None or cve in ids:
-                        lo = mid + 1  # still present, or couldn't verify: keep searching upward
-                    else:
-                        hi = mid
-                    st["bounds"][cve] = [lo, hi]
-                    if lo < hi:
-                        still_active = True
-            if not still_active:
-                break
-
-        for ref, st in search_state.items():
-            for cve, (lo, _hi) in st["bounds"].items():
-                fix_info[ref]["fixes"][cve] = st["candidates"][lo]
+            fix_info[ref] = entry
 
     fix_info_path = os.path.join(WORK_DIR, "fix_info.json")
     with open(fix_info_path, "w", encoding="utf-8") as fh:
@@ -391,6 +313,7 @@ def main():
     print(f"  wrote {fix_info_path}")
 
     return 0
+
 
 
 if __name__ == "__main__":
