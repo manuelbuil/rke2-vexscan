@@ -44,10 +44,23 @@ WORK_DIR = "reports/releases"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 EXCULPATORY = ("not_affected", "fixed")
 
+# Not independently patchable: these ship at whatever version RKE2 itself
+# pins, and moving either to a different tag means running a different
+# Kubernetes version, not applying a fix to a sidecar. There is no
+# remediation to show for them other than "upgrade RKE2", so they're
+# excluded from scanning and from the site entirely rather than publishing
+# a CVE list with no actionable answer attached to it.
+EXCLUDED_COMPONENTS = {"rke2-runtime", "hardened-kubernetes"}
+
+
+def component_name_of(ref):
+    return ref.rsplit("/", 1)[-1].rsplit(":", 1)[0]
+
 
 def read_lines(dir_path):
     """Return this release's fleet-list lines as (ref, rest) pairs, in file
-    order. rest is "" for a bare reference with no assertion."""
+    order, excluding EXCLUDED_COMPONENTS. rest is "" for a bare reference
+    with no assertion."""
     fleet_path = os.path.join(dir_path, "fleet.txt")
     remote_url_path = os.path.join(dir_path, "fleet.txt.remote-url")
 
@@ -72,6 +85,8 @@ def read_lines(dir_path):
         parts = line.split(None, 1)
         ref = parts[0]
         rest = parts[1] if len(parts) > 1 else ""
+        if component_name_of(ref) in EXCLUDED_COMPONENTS:
+            continue
         pairs.append((ref, rest))
     return pairs
 
