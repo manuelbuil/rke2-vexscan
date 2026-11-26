@@ -33,9 +33,6 @@ jobs:
   scan:
     runs-on: ubuntu-latest
     timeout-minutes: 120
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/checkout@v4
 
@@ -107,6 +104,26 @@ jobs:
         with:
           path: site
 
+  deploy:
+    # A separate job, not just a later step in "scan": actions/deploy-pages
+    # immediately after actions/upload-pages-artifact in the same job can
+    # outrun GitHub's own indexing of the artifact it just uploaded --
+    # "No artifacts named github-pages were found for this workflow run"
+    # even though the artifact is right there (hit twice in a row before
+    # this split). A new job starting on a fresh runner takes long enough
+    # that the artifact is reliably indexed by the time deploy-pages looks
+    # for it; this is the pattern GitHub's own Pages-via-Actions templates
+    # use for the same reason.
+    needs: scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
